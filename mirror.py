@@ -11,17 +11,22 @@ from telethon.tl.types import DocumentAttributeVideo
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
-SOURCE_GROUP = os.environ["SOURCE_GROUP"]   # e.g. -1001234567890
+SOURCE_GROUP = os.environ["SOURCE_GROUP"]
 TARGET_GROUP = os.environ["TARGET_GROUP"]
 
-# knobs (can override from the workflow)
-TIME_BUDGET_MIN = float(os.environ.get("TIME_BUDGET_MIN", "240"))   # stop before GH kills job at 6h
-MAX_VIDEOS_PER_RUN = int(os.environ.get("MAX_VIDEOS_PER_RUN", "0")) # 0 = no cap
+TIME_BUDGET_MIN = float(os.environ.get("TIME_BUDGET_MIN", "240"))
+MAX_VIDEOS_PER_RUN = int(os.environ.get("MAX_VIDEOS_PER_RUN", "0"))
 DELAY_SECONDS = float(os.environ.get("DELAY_SECONDS", "1"))
 MIN_FREE_GB = float(os.environ.get("MIN_FREE_GB", "2"))
 
 PROGRESS_FILE = "progress.json"
 DOWNLOAD_DIR = "downloads"
+MB = 1024 * 1024
+
+
+def log(msg):
+    # timestamped + flush=True so it appears in the GitHub Actions live log instantly
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def load_progress():
@@ -32,7 +37,6 @@ def load_progress():
 
 
 def save_progress(p):
-    # atomic write so a killed job can't corrupt it
     with open(PROGRESS_FILE + ".tmp", "w") as f:
         json.dump(p, f, indent=2)
     os.replace(PROGRESS_FILE + ".tmp", PROGRESS_FILE)
@@ -50,104 +54,171 @@ def is_video(msg):
     return False
 
 
-async def resolve_chat(client, value):
-    """Accepts @username or numeric id; falls back to scanning your dialogs."""
+def make_progress(label):
+    state = {"last": 0}
+    def cb(current, total):
+        if not total:
+            return
+        step = max(total // 10, 50 * MB)  # print every 10% or every 50MB
+        if current - state["last"] >= step or current >= total:
+            state["last"] = current
+            log(f"      {label}: {current/MB:.0f}/{total/MB:.0f} MB")
+    return cb
+
+
+async def heartbeat():
+    mins = 0
+    while True:
+        await asyncio.sleep(60)
+        mins += 1
+        log(f"[alive {mins}min | disk {free_gb():.1f}GB free | total done so far: OK]")
+
+
+async def resolve_chat(client, value, label):
     value = value.strip()
+    log(f"Resolving {label} chat: {value}")
     try:
         value = int(value)
     except ValueError:
-        return await client.get_entity(value)
+        entity = await client.get_entity(value)
+        log(f"{label} resolved -> '{getattr(entity, 'title', entity.id)}'")
+        return entity
 
     try:
-        return await client.get_entity(value)
+        entity = await client.get_entity(value)
     except ValueError:
-        pass
-    async for d in client.iter_dialogs():
-        if d.id == value or getattr(d.entity, "id", None) == value:
-            return d.entity
-    raise RuntimeError(f"Chat not found: {value} — run list_chats.py to get the right id")
+        log(f"{label} id not in session cache, scanning all dialogs (can take a minute)...")
+        entity = None
+        async for d in client.iter_dialogs():
+            if d.id == value or getattr(d.entity, "id", None) == value:
+                entity = d.entity
+                break
+        if entity is None:
+            raise RuntimeError(
+                f"{label} chat {value} NOT FOUND. Is this account a member of it? "
+                f"Run list_chats.py and copy the EXACT id from there."
+            )
+    log(f"{label} resolved -> '{getattr(entity, 'title', entity.id)}' (id: {entity.id})")
+    return entity
 
 
 async def transfer(client, msg, dst):
-    path = await msg.download_media(file=DOWNLOAD_DIR)
+    size = getattr(getattr(msg, "document", None), "size", 0) or 0
+    log(f"  msg {msg.id}: DOWNLOADING video ({size/MB:.1f} MB)...")
+    path = await msg.download_media(file=DOWNLOAD_DIR, progress_callback=make_progress("dl"))
     if not path:
         raise RuntimeError("download_media returned nothing")
 
-    kwargs = {"caption": msg.message or "", "supports_streaming": True, "parse_mode": None}
+    log(f"  msg {msg.id}: UPLOADING to target group...")
+    kwargs = {"caption": msg.message or "", "supports_streaming": True,
+              "parse_mode": None, "progress_callback": make_progress("ul")}
     try:
-        # formatting_entities keeps bold/links/etc. from the original caption
         await client.send_file(dst, path, formatting_entities=msg.entities, **kwargs)
-    except TypeError:  # older telethon without formatting_entities
+    except TypeError:
         await client.send_file(dst, path, **kwargs)
     finally:
         try:
-            os.remove(path)  # free disk immediately
+            os.remove(path)
         except OSError:
             pass
 
 
 async def main():
+    log("=" * 60)
+    log("TELEGRAM VIDEO MIRROR — starting")
+    log(f"Time budget: {TIME_BUDGET_MIN} min | delay: {DELAY_SECONDS}s | "
+        f"video cap: {MAX_VIDEOS_PER_RUN or 'unlimited'}")
+    log("=" * 60)
+
     progress = load_progress()
     shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+    log("Connecting to Telegram...")
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-        src = await resolve_chat(client, SOURCE_GROUP)
-        dst = await resolve_chat(client, TARGET_GROUP)
+        me = await client.get_me()
+        full_name = " ".join(x for x in [me.first_name, me.last_name] if x)
+        uname = f"@{me.username}" if me.username else "(no username)"
+        phone = f"+{me.phone}" if me.phone else "(phone hidden)"
+        log(f"Logged in as: {full_name} ({uname}) | ID: {me.id} | {phone}")
 
-        print(f"Resuming after message id {progress['last_id']} | done so far: {progress['total_done']}")
+        src = await resolve_chat(client, SOURCE_GROUP, "SOURCE")
+        dst = await resolve_chat(client, TARGET_GROUP, "TARGET")
 
+        if src.id == dst.id:
+            log("!!! WARNING: source and target are THE SAME CHAT — check your secrets !!!")
+
+        total_messages = await client.get_messages(src, limit=0)
+        log(f"Source chat contains ~{total_messages.total} messages total")
+
+        log(f"Resuming after message id {progress['last_id']} | videos done so far: {progress['total_done']}")
+        log("Scanning history oldest -> newest... (first video can take a while on big chats)")
+
+        hb = asyncio.create_task(heartbeat())
         deadline = time.time() + TIME_BUDGET_MIN * 60
         done_this_run = 0
+        skipped = 0
 
-        # reverse=True -> oldest to newest, min_id -> skip everything already done
-        async for msg in client.iter_messages(src, reverse=True, min_id=progress["last_id"]):
-            if not is_video(msg):
-                progress["last_id"] = msg.id  # pass over non-video msgs but remember them
-                continue
+        try:
+            async for msg in client.iter_messages(src, reverse=True, min_id=progress["last_id"]):
+                if not is_video(msg):
+                    progress["last_id"] = msg.id
+                    skipped += 1
+                    if skipped % 500 == 0:
+                        log(f"  ...skipped {skipped} non-video messages so far (at msg {msg.id})")
+                        save_progress(progress)
+                    continue
 
-            if time.time() > deadline:
-                print("Time budget reached — stopping, next run continues from here.")
-                break
-            if MAX_VIDEOS_PER_RUN and done_this_run >= MAX_VIDEOS_PER_RUN:
-                print("Video cap for this run reached — stopping.")
-                break
-            if free_gb() < MIN_FREE_GB:
-                print("Runner disk almost full — stopping.")
-                break
+                if time.time() > deadline:
+                    log("Time budget reached — stopping. Next run continues from here.")
+                    break
+                if MAX_VIDEOS_PER_RUN and done_this_run >= MAX_VIDEOS_PER_RUN:
+                    log("Video cap for this run reached — stopping.")
+                    break
+                if free_gb() < MIN_FREE_GB:
+                    log("Runner disk almost full — stopping.")
+                    break
 
-            try:
-                await transfer(client, msg, dst)
-                done_this_run += 1
-                progress["total_done"] += 1
-                print(f"[{progress['total_done']}] msg {msg.id} -> uploaded")
-            except errors.FloodWaitError as fw:
-                wait = min(int(fw.seconds) + 5, 3600)
-                print(f"Telegram flood wait {fw.seconds}s -> sleeping {wait}s")
-                save_progress(progress)
-                await asyncio.sleep(wait)
+                log(f"--- Video #{progress['total_done'] + 1} (msg {msg.id}) ---")
                 try:
                     await transfer(client, msg, dst)
                     done_this_run += 1
                     progress["total_done"] += 1
-                    print(f"[{progress['total_done']}] msg {msg.id} -> uploaded (after wait)")
+                    log(f"[{progress['total_done']}] msg {msg.id} -> UPLOADED SUCCESSFULLY")
+                except errors.FloodWaitError as fw:
+                    wait = min(int(fw.seconds) + 5, 3600)
+                    log(f"Telegram flood wait {fw.seconds}s -> sleeping {wait}s")
+                    save_progress(progress)
+                    await asyncio.sleep(wait)
+                    try:
+                        await transfer(client, msg, dst)
+                        done_this_run += 1
+                        progress["total_done"] += 1
+                        log(f"[{progress['total_done']}] msg {msg.id} -> UPLOADED (after flood wait)")
+                    except Exception as e:
+                        log(f"msg {msg.id} FAILED after flood retry: {e}")
+                        progress["failed"].append(msg.id)
                 except Exception as e:
-                    print(f"msg {msg.id} failed after flood retry: {e}")
+                    log(f"msg {msg.id} FAILED ({type(e).__name__}): {e}")
                     progress["failed"].append(msg.id)
-            except Exception as e:
-                # don't let one broken video block 90k others
-                print(f"msg {msg.id} FAILED ({type(e).__name__}): {e}")
-                progress["failed"].append(msg.id)
 
-            progress["last_id"] = msg.id
+                progress["last_id"] = msg.id
+                save_progress(progress)
+                await asyncio.sleep(DELAY_SECONDS)
+        finally:
+            hb.cancel()
             save_progress(progress)
-            await asyncio.sleep(DELAY_SECONDS)
 
-        save_progress(progress)
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        print(f"RUN SUMMARY: {done_this_run} this run | {progress['total_done']} total | "
-              f"last_id={progress['last_id']} | failed={len(progress['failed'])}")
+        log("=" * 60)
+        log(f"RUN SUMMARY: {done_this_run} uploaded this run | {progress['total_done']} total | "
+            f"last_id={progress['last_id']} | failed={len(progress['failed'])}")
+        if progress["failed"]:
+            log(f"Failed message ids: {progress['failed'][-20:]}")
+        log("Done.")
+        log("=" * 60)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
