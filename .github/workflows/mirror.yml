@@ -1,0 +1,53 @@
+name: Telegram Video Mirror
+
+on:
+  workflow_dispatch:          # manual "Run workflow" button
+  schedule:
+    - cron: "*/30 * * * *"    # keeps queueing runs back-to-back
+
+permissions:
+  contents: write             # needed to commit progress.json back
+
+concurrency:
+  group: telegram-mirror
+  cancel-in-progress: false   # never kill a transfer mid-video
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350      # GitHub hard limit is 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run mirror
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          SOURCE_GROUP: ${{ secrets.SOURCE_GROUP }}
+          TARGET_GROUP: ${{ secrets.TARGET_GROUP }}
+          # TIME_BUDGET_MIN: "240"
+          # MAX_VIDEOS_PER_RUN: "1000"
+          # DELAY_SECONDS: "2"
+        run: python mirror.py
+
+      - name: Commit progress
+        if: always()          # save progress even if the run failed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add progress.json
+          if git diff --cached --quiet; then
+            echo "No progress changes"
+          else
+            git commit -m "progress: $(date -u +'%Y-%m-%d %H:%M') UTC"
+            git push
+          fi
