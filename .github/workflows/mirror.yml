@@ -35,7 +35,7 @@ jobs:
           SOURCE_GROUP: ${{ secrets.SOURCE_GROUP }}
           TARGET_GROUP: ${{ secrets.TARGET_GROUP }}
           # TIME_BUDGET_MIN: "240"
-          # MAX_VIDEOS_PER_RUN: "1000"
+          MAX_VIDEOS_PER_RUN: "1"
           # DELAY_SECONDS: "2"
         run: python mirror.py
 
