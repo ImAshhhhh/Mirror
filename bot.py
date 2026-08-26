@@ -7,26 +7,39 @@ import shutil
 import asyncio
 import mimetypes
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
 # =========================================================
-# CONFIG — all from environment variables now
+# CONFIG — everything from environment variables (GitHub secrets)
 # =========================================================
-# Required:  API_ID, API_HASH, SESSION_STRING
-# Optional:  RATE_LIMIT (default 2), MAX_DOWNLOAD_WORKERS (default 5),
-#            DOWNLOAD_DIR (default "downloads"),
-#            IDLE_EXIT_MIN (auto-exit when nothing is running; 0 = never)
+# REQUIRED:
+#   API_ID, API_HASH, SESSION_STRING
+#   SOURCE_GROUP  -> the group/channel WITH the videos (-100xxxx or @username)
+#   TARGET_GROUP  -> YOUR group where videos go      (-100xxxx or @username)
+# OPTIONAL:
+#   START_ID         default 1   -> start from the very first message
+#   END_ID           default off -> go all the way to the newest message
+#   SOURCE_TOPIC_ID  only copy from this forum topic
+#   TARGET_TOPIC_ID  upload into this forum topic in the target
+#   RATE_LIMIT       seconds between uploads (default 2)
+#   MAX_DOWNLOAD_WORKERS parallel downloads (default 3)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 STRING_SESSION = os.environ["SESSION_STRING"]
+SOURCE_GROUP = os.environ["SOURCE_GROUP"].strip()
+TARGET_GROUP = os.environ["TARGET_GROUP"].strip()
+
+START_ID = int(os.environ.get("START_ID", "1"))
+END_ID = int(os.environ["END_ID"]) if os.environ.get("END_ID") else None
+SOURCE_TOPIC_ID = int(os.environ["SOURCE_TOPIC_ID"]) if os.environ.get("SOURCE_TOPIC_ID") else None
+TARGET_TOPIC_ID = int(os.environ["TARGET_TOPIC_ID"]) if os.environ.get("TARGET_TOPIC_ID") else None
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "2"))
-MAX_DOWNLOAD_WORKERS = int(os.environ.get("MAX_DOWNLOAD_WORKERS", "5"))
-IDLE_EXIT_MIN = float(os.environ.get("IDLE_EXIT_MIN", "0"))
+RATE_LIMIT = float(os.environ.get("RATE_LIMIT", "2"))
+MAX_DOWNLOAD_WORKERS = int(os.environ.get("MAX_DOWNLOAD_WORKERS", "3"))
 
 TASK_FILE = "task.json"   # resume state — committed back to the repo by the workflow
 
@@ -36,19 +49,18 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# =========================================================
-# GLOBALS
-# =========================================================
-
-task_running = False
-user_state = {}
 upload_queue = asyncio.Queue()
-current_task = None   # mirror of TASK_FILE — this is what makes resume work
+current_task = None
+stats = {"uploaded": 0, "queued": 0}
+scan_cursor = {"id": 0}
 
 
 def log(msg):
-    # timestamped + flushed -> shows LIVE in the GitHub Actions log
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def free_gb():
+    return shutil.disk_usage(".").free / 1e9
 
 
 def load_task():
@@ -63,7 +75,7 @@ def save_task(task):
     tmp = TASK_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(task, f, indent=2)
-    os.replace(tmp, TASK_FILE)   # atomic — can't corrupt if the job is killed mid-write
+    os.replace(tmp, TASK_FILE)   # atomic — safe even if the job is killed mid-write
 
 
 def clear_task_file():
@@ -73,96 +85,86 @@ def clear_task_file():
         pass
 
 
-def free_gb():
-    return shutil.disk_usage(".").free / 1e9
-
 # =========================================================
-# PARSE LINK (unchanged logic)
+# RESOLVE CHATS — works on a fresh runner (accepts id or @username)
 # =========================================================
 
-def parse_link(link):
-    link = link.strip()
-    if not link:
-        raise Exception("Empty link")
-
-    if link.startswith("-100"):
-        chat, msg_part = link.split("/")
-        if "-" in msg_part:
-            start_id, end_id = map(int, msg_part.split("-"))
-            return {"chat": int(chat), "range": True, "start_id": start_id, "end_id": end_id}
-        else:
-            return {"chat": int(chat), "range": False, "start_id": int(msg_part)}
-
-    if link.endswith("/"):
-        link = link[:-1]
-    parts = link.split("/")
-
-    if "/c/" in link:
-        if len(parts) < 6:
-            raise Exception("Invalid private link")
-        group_id = parts[-2]
-        msg_part = parts[-1]
-        chat = int(f"-100{group_id}")
-    else:
-        if len(parts) < 5:
-            raise Exception("Invalid Telegram link")
-        chat = parts[-2]
-        msg_part = parts[-1]
-
-    if "-" in msg_part:
-        start_id, end_id = map(int, msg_part.split("-"))
-        return {"chat": chat, "range": True, "start_id": start_id, "end_id": end_id}
-    else:
-        return {"chat": chat, "range": False, "start_id": int(msg_part)}
-
-# =========================================================
-# RESOLVE ENTITY (works even on a fresh runner with empty cache)
-# =========================================================
-
-async def resolve_entity(chat):
+async def resolve_entity(ref, label):
+    ref = str(ref).strip()
     try:
-        return await client.get_entity(chat)
+        ref_int = int(ref)
+    except ValueError:
+        ref_int = None
+
+    try:
+        entity = await client.get_entity(ref)
+        name = getattr(entity, "title", None) or getattr(entity, "username", None) or entity.id
+        log(f"{label} resolved -> '{name}' (id: {entity.id})")
+        return entity
     except Exception:
         pass
-    async for dialog in client.iter_dialogs():
-        try:
+
+    if ref_int is not None:
+        async for dialog in client.iter_dialogs():
             ent_id = getattr(dialog.entity, "id", None)
-            if (str(dialog.id) == str(chat)
-                    or (ent_id is not None and (str(ent_id) == str(chat)
-                        or f"-100{ent_id}" == str(chat)))):
+            try:
+                marked = int(f"-100{ent_id}") if ent_id is not None else None
+            except (TypeError, ValueError):
+                marked = None
+            if dialog.id == ref_int or ent_id == ref_int or marked == ref_int:
+                log(f"{label} resolved via dialog scan -> '{dialog.name}'")
                 return dialog.entity
-        except Exception:
-            pass
-    return None
+
+    raise RuntimeError(
+        f"{label} '{ref}' NOT FOUND. Is this account a member of that chat? "
+        f"Run list_chats.py locally and copy the exact id."
+    )
+
+
+async def resolve_any(candidates, label):
+    last_err = None
+    for c in candidates:
+        if c in (None, ""):
+            continue
+        try:
+            return await resolve_entity(c, label)
+        except Exception as e:
+            last_err = e
+    raise last_err or RuntimeError(f"{label} could not be resolved")
+
 
 # =========================================================
-# DOWNLOAD WORKER
+# DOWNLOAD WORKER (same logic as your bot: parallel + queue)
 # =========================================================
 
-async def download_worker(message, destination):
+async def download_worker(message, destination, topic_id):
     try:
-        # wait if disk is nearly full — finished uploads free space as they go
+        # back off if disk is filling — finished uploads free space as they go
         while free_gb() < 1.5 and not upload_queue.empty():
             await asyncio.sleep(10)
 
         log(f"[DOWNLOAD] msg {message.id}")
         file_path = await message.download_media(file=DOWNLOAD_DIR)
         if not file_path:
-            log(f"[SKIP] msg {message.id} — no media")
+            log(f"[SKIP] msg {message.id} — no downloadable media")
             return
+
         caption = (message.message or "")[:1024]
+        stats["queued"] += 1
         await upload_queue.put({
             "file_path": file_path,
             "caption": caption,
             "destination": destination,
-            "msg_id": message.id,   # needed so resume knows how far we got
+            "topic_id": topic_id,
+            "msg_id": message.id,
         })
         log(f"[QUEUED] msg {message.id} -> {os.path.basename(file_path)}")
     except Exception as e:
-        log(f"[DOWNLOAD ERROR] {e}")
+        log(f"[DOWNLOAD ERROR] msg {message.id}: {e}")
+
 
 # =========================================================
-# UPLOAD WORKER
+# UPLOAD WORKER (one at a time + rate limit + flood retry)
 # =========================================================
 
 async def upload_worker():
@@ -170,44 +172,43 @@ async def upload_worker():
         data = await upload_queue.get()
         try:
             file_path = data["file_path"]
-            caption = data["caption"]
-            destination = data["destination"]
             log(f"[UPLOAD] msg {data['msg_id']}")
 
             mime_type, _ = mimetypes.guess_type(file_path)
             supports_streaming = bool(mime_type and mime_type.startswith("video"))
-            # NOTE: removed the fake DocumentAttributeVideo(duration=0, w=1280, h=720)
-            # — that wrote wrong metadata. Let Telegram detect real duration/size itself.
 
             async def send_it():
-                return await client.send_file(
-                    destination,
-                    file=file_path,
-                    caption=caption,
-                    supports_streaming=supports_streaming,
-                    force_document=False,
-                    allow_cache=False,
-                    part_size_kb=512,
-                )
+                kwargs = {
+                    "file": file_path,
+                    "caption": data["caption"],
+                    "supports_streaming": supports_streaming,
+                    "force_document": False,
+                    "allow_cache": False,
+                    "part_size_kb": 512,
+                }
+                if data.get("topic_id"):
+                    kwargs["reply_to"] = data["topic_id"]
+                return await client.send_file(data["destination"], **kwargs)
 
             try:
                 await send_it()
             except FloodWaitError as e:
                 wait_time = int(e.seconds)
-                log(f"[FLOOD WAIT] {wait_time}s")
+                log(f"[FLOOD WAIT] {wait_time}s — sleeping")
                 await asyncio.sleep(wait_time)
                 await send_it()
 
-            log(f"[UPLOADED] msg {data['msg_id']}")
+            stats["uploaded"] += 1
+            log(f"[UPLOADED] msg {data['msg_id']} (total this run: {stats['uploaded']})")
 
-            # RESUME POINT — remember this message is fully done
+            # RESUME POINT — this message is fully done
             if current_task is not None:
                 recent = current_task.setdefault("done_recent", [])
                 if data["msg_id"] not in recent:
                     recent.append(data["msg_id"])
-                del recent[:-50]  # keep only the last 50 (small file, safe resume window)
-                current_task["last_done_id"] = max(current_task.get("last_done_id", 0),
-                                                   data["msg_id"])
+                del recent[:-100]   # keep last 100 — small file, safe resume window
+                current_task["last_done_id"] = max(
+                    current_task.get("last_done_id", 0), data["msg_id"])
                 save_task(current_task)
 
             try:
@@ -219,268 +220,104 @@ async def upload_worker():
             await asyncio.sleep(RATE_LIMIT)
 
         except Exception as e:
-            log(f"[UPLOAD ERROR] {e}")
+            log(f"[UPLOAD ERROR] msg {data['msg_id']}: {e}")
         finally:
             upload_queue.task_done()
 
+
 # =========================================================
-# TASK RUNNER (shared by interactive start AND auto-resume)
+# TASK EXECUTION
 # =========================================================
 
-async def run_task(entity, chat_ref, destination, dest_name,
-                   start_id, range_mode, end_id, topic_mode, topic_id,
-                   resume_min_id=None, done_ids=None):
-    global task_running, current_task
+def in_source_topic(message, topic_id):
+    if not topic_id:
+        return True
+    reply = getattr(message, "reply_to", None)
+    if not reply:
+        return False
+    top = getattr(reply, "reply_to_top_id", None) or getattr(reply, "reply_to_msg_id", None)
+    return top == topic_id
 
-    task_running = True
-    done_ids = done_ids or set()
-    min_id = resume_min_id if resume_min_id is not None else start_id - 1
 
-    current_task = {
-        "chat": str(chat_ref),
-        "chat_id": entity.id,
-        "destination": destination,
-        "dest_name": dest_name,
-        "start_id": start_id,
-        "end_id": end_id,
-        "range_mode": range_mode,
-        "topic_mode": topic_mode,
-        "topic_id": topic_id,
-        "last_done_id": min_id,
-        "done_recent": [],
-    }
-    save_task(current_task)
+async def execute_task(task):
+    global current_task
+    current_task = task
+    save_task(task)
 
-    text = f"🚀 **Task started**\n📤 `{dest_name}`\n"
-    if range_mode:
-        text += f"🔢 `{start_id}` → `{end_id}`\n"
-    else:
-        text += f"🔢 From `{start_id}` → Latest\n"
-    if resume_min_id is not None:
-        text += f"♻️ Resumed from msg `{resume_min_id}`\n"
-    if topic_mode:
-        text += f"🧵 Topic: `{topic_id}`\n"
-    try:
-        await client.send_message("me", text, parse_mode="md")
-    except Exception:
-        pass
+    source = await resolve_any([task.get("source_id"), task.get("source_ref")], "SOURCE")
+    destination = await resolve_any(
+        [task.get("destination_id"), task.get("destination_ref")], "TARGET")
 
-    if range_mode:
-        iterator = client.iter_messages(entity, min_id=min_id, max_id=end_id + 1, reverse=True)
-    else:
-        iterator = client.iter_messages(entity, min_id=min_id, reverse=True)
+    # remember resolved ids/names so the next run can resume by id
+    task["source_id"] = source.id
+    task["destination_id"] = destination.id
+    task["destination_name"] = getattr(destination, "title", None) or str(destination.id)
+    save_task(task)
+
+    if source.id == destination.id:
+        log("!!! WARNING: SOURCE and TARGET are the same chat — check your secrets !!!")
+
+    done_ids = set(task.get("done_recent") or [])
+    min_id = task.get("last_done_id") or (task.get("start_id", 1) - 1)
+    if done_ids:
+        min_id = min(min_id, min(done_ids) - 1)   # re-scan window in case a kill left stragglers
+
+    log(f"Transfer: '{getattr(source, 'title', source.id)}' -> '{task['destination_name']}'")
+    log(f"Continuing after msg id {min_id} | known-done ids: {len(done_ids)}")
+
+    kwargs = {"min_id": min_id, "reverse": True}   # reverse=True = oldest -> newest
+    if task.get("end_id"):
+        kwargs["max_id"] = task["end_id"] + 1
+    iterator = client.iter_messages(source, **kwargs)
 
     tasks = []
     semaphore = asyncio.Semaphore(MAX_DOWNLOAD_WORKERS)
 
     async for message in iterator:
-        if not task_running:
-            break
+        scan_cursor["id"] = message.id
 
-        if message.id in done_ids:   # already uploaded before the last restart
+        if message.id in done_ids:      # already uploaded in a previous run
+            continue
+        if not in_source_topic(message, task.get("source_topic_id")):
+            continue
+        if not message.media:           # same rule as your bot: media messages only
             continue
 
-        if topic_mode:
-            try:
-                if not message.reply_to:
-                    continue
-                if message.reply_to.reply_to_top_id != topic_id:
-                    continue
-            except Exception:
-                continue
-
-        if not message.media:
+        size = getattr(getattr(message, "document", None), "size", 0) or 0
+        if size > 13 * 1024 ** 3:       # runner only has ~14GB disk
+            log(f"[SKIP] msg {message.id}: {size / 1e9:.1f}GB too big for runner disk")
             continue
 
         async def wrapped_download(msg):
             async with semaphore:
-                await download_worker(msg, destination)
+                await download_worker(msg, destination, task.get("target_topic_id"))
 
         tasks.append(asyncio.create_task(wrapped_download(message)))
 
+    log(f"Scan finished — {len(tasks)} media found this pass. Draining downloads/uploads...")
     await asyncio.gather(*tasks)
     await upload_queue.join()
 
-    task_running = False
-    clear_task_file()   # finished (or /stop) — nothing to resume next time
-    log("TASK FINISHED — task.json cleared")
+    clear_task_file()
+    log("ALL DONE — task.json cleared, nothing left to resume")
     try:
-        await client.send_message("me", "✅ **Done!**", parse_mode="md")
+        await client.send_message("me", "✅ **Mirror finished!**", parse_mode="md")
     except Exception:
         pass
 
+
 # =========================================================
-# IDLE WATCHDOG — exit cleanly when nothing is happening
-# (stops Actions runs from sitting zombie for 6 hours)
+# HEARTBEAT — proves the run isn't frozen during long scans
 # =========================================================
 
-async def idle_watchdog():
-    if not IDLE_EXIT_MIN:
-        return
-    idle_since = time.time()
+async def heartbeat():
+    mins = 0
     while True:
         await asyncio.sleep(60)
-        busy = task_running or (not upload_queue.empty()) or bool(user_state)
-        if busy:
-            idle_since = time.time()
-            continue
-        if time.time() - idle_since > IDLE_EXIT_MIN * 60:
-            log(f"Idle for {IDLE_EXIT_MIN:.0f} min with no active task — exiting cleanly")
-            await client.disconnect()
-            return
+        mins += 1
+        log(f"[alive {mins}min | disk {free_gb():.1f}GB | done this run: {stats['uploaded']} "
+            f"| in queue: {upload_queue.qsize()} | scanning at msg {scan_cursor['id']}]")
 
-# =========================================================
-# COMMANDS
-# =========================================================
-
-@client.on(events.NewMessage(pattern=r"^/start$"))
-async def start(event):
-    me = await client.get_me()
-    if event.chat_id != me.id:
-        return
-    await event.reply(
-        "👋 **Telegram Mirror**\n\n"
-        "Send Telegram link:\n"
-        "`https://t.me/c/123/100`\n"
-        "`https://t.me/c/123/100-200`\n"
-        "`-100123/100`\n\n"
-        f"⚡ {MAX_DOWNLOAD_WORKERS} parallel downloads\n"
-        f"⏳ {RATE_LIMIT}s upload delay",
-        parse_mode="md")
-
-
-@client.on(events.NewMessage(pattern=r"^/stop$"))
-async def stop(event):
-    global task_running
-    me = await client.get_me()
-    if event.chat_id != me.id:
-        return
-    task_running = False
-    log("Received /stop — draining queue, then stopping")
-    await event.reply("⏹ Stopped (queued uploads will finish)", parse_mode="md")
-
-# =========================================================
-# HELPER: Send long message in chunks
-# =========================================================
-
-async def send_long_message(event, text, max_len=4000):
-    if len(text) <= max_len:
-        await event.reply(text, parse_mode="md")
-        return
-
-    lines = text.split("\n")
-    chunks = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 <= max_len:
-            current += line + "\n"
-        else:
-            chunks.append(current.strip())
-            current = line + "\n"
-    if current:
-        chunks.append(current.strip())
-
-    for chunk in chunks:
-        await event.reply(chunk, parse_mode="md")
-        await asyncio.sleep(0.5)
-
-# =========================================================
-# HANDLER
-# =========================================================
-
-@client.on(events.NewMessage)
-async def handler(event):
-    global task_running
-
-    me = await client.get_me()
-    if event.chat_id != me.id:
-        return
-    if (event.raw_text or "").startswith("/"):
-        return
-
-    user_id = event.sender_id
-
-    if user_id not in user_state:
-        link = (event.raw_text or "").strip()
-        try:
-            parsed = parse_link(link)
-
-            entity = await resolve_entity(parsed["chat"])
-            if not entity:
-                return await event.reply(
-                    "❌ Cannot access chat.\nCheck: joined? opened? link valid?",
-                    parse_mode="md")
-
-            parsed["entity"] = entity
-
-            topic_mode = False
-            topic_id = None
-            try:
-                msg = await client.get_messages(entity, ids=parsed["start_id"])
-                if msg and getattr(msg, "reply_to", None) and getattr(msg.reply_to, "reply_to_top_id", None):
-                    topic_mode = True
-                    topic_id = msg.reply_to.reply_to_top_id
-                    log(f"[TOPIC MODE] {topic_id}")
-            except Exception as e:
-                log(f"[TOPIC DETECT] {e}")
-
-            parsed["topic_mode"] = topic_mode
-            parsed["topic_id"] = topic_id
-            user_state[user_id] = parsed
-
-            dialogs = []
-            text = "📤 **Choose destination (send NUMBER)**\n\n"
-            index = 1
-            async for dialog in client.iter_dialogs():
-                try:
-                    ent = dialog.entity
-                    if getattr(ent, "megagroup", False) or getattr(ent, "broadcast", False):
-                        dialogs.append(dialog)
-                        text += f"{index}. {dialog.name}\n"
-                        index += 1
-                except Exception:
-                    pass
-
-            if not dialogs:
-                await event.reply("❌ No groups/channels to send to!")
-                return
-
-            user_state[user_id]["dialogs"] = dialogs
-            await send_long_message(event, text)
-
-        except Exception as e:
-            await event.reply(f"❌ Error: `{str(e)}`", parse_mode="md")
-        return
-
-    data = user_state[user_id]
-    choice = (event.raw_text or "").strip()
-
-    if "/" in choice or "t.me/" in choice or choice.startswith("-100"):
-        del user_state[user_id]
-        return await handler(event)
-
-    if not choice.isdigit():
-        return await event.reply("❌ Send a valid NUMBER")
-
-    choice = int(choice)
-    dialogs = data["dialogs"]
-    if choice < 1 or choice > len(dialogs):
-        return await event.reply("❌ Invalid choice")
-
-    selected_dialog = dialogs[choice - 1]
-    user_state.pop(user_id, None)
-
-    await run_task(
-        entity=data["entity"],
-        chat_ref=data["chat"],
-        destination=selected_dialog.id,
-        dest_name=selected_dialog.name,
-        start_id=data["start_id"],
-        range_mode=data["range"],
-        end_id=data.get("end_id"),
-        topic_mode=data["topic_mode"],
-        topic_id=data["topic_id"],
-    )
 
 # =========================================================
 # MAIN
@@ -492,42 +329,35 @@ async def main():
     log("=" * 60)
     log(f"✅ Logged in as: {full_name} (@{me.username}) | ID: {me.id}")
     log(f"⚡ {MAX_DOWNLOAD_WORKERS} parallel downloads | ⏳ {RATE_LIMIT}s upload delay")
-    log("🚀 Send a link in Saved Messages to start a new task")
     log("=" * 60)
 
-    asyncio.create_task(upload_worker())
-    asyncio.create_task(idle_watchdog())
-
-    # AUTO-RESUME: if a previous run was killed mid-task, continue it
     task = load_task()
     if task:
-        log(f"Found unfinished task in {TASK_FILE} — AUTO-RESUMING")
-        log(f"  destination: {task.get('dest_name')} | last uploaded msg: {task.get('last_done_id')}")
-        entity = await resolve_entity(task.get("chat_id") or task.get("chat"))
-        if entity is None:
-            log("!! Could not resolve source chat from task.json — send a new link to start over")
-            clear_task_file()
-        else:
-            done_recent = task.get("done_recent") or []
-            if done_recent:
-                resume_min = min(done_recent) - 1
-            else:
-                resume_min = task.get("last_done_id") or (task.get("start_id", 1) - 1)
-            await run_task(
-                entity=entity,
-                chat_ref=task.get("chat"),
-                destination=task["destination"],
-                dest_name=task.get("dest_name", str(task["destination"])),
-                start_id=task.get("start_id", resume_min + 1),
-                range_mode=task.get("range_mode", False),
-                end_id=task.get("end_id"),
-                topic_mode=task.get("topic_mode", False),
-                topic_id=task.get("topic_id"),
-                resume_min_id=resume_min,
-                done_ids=set(done_recent),
-            )
+        log(f"Found unfinished task in {TASK_FILE} — RESUMING it")
+        log(f"   destination: {task.get('destination_name')} | last uploaded msg: {task.get('last_done_id')}")
+    else:
+        task = {
+            "source_ref": SOURCE_GROUP,
+            "destination_ref": TARGET_GROUP,
+            "start_id": START_ID,
+            "end_id": END_ID,
+            "source_topic_id": SOURCE_TOPIC_ID,
+            "target_topic_id": TARGET_TOPIC_ID,
+            "last_done_id": START_ID - 1,
+            "done_recent": [],
+        }
+        log(f"New task from env: SOURCE {SOURCE_GROUP} -> TARGET {TARGET_GROUP}")
+        log(f"   from msg {START_ID} -> " + (f"{END_ID}" if END_ID else "newest (oldest first)"))
+
+    asyncio.create_task(upload_worker())
+    hb = asyncio.create_task(heartbeat())
+    try:
+        await execute_task(task)
+    finally:
+        hb.cancel()
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+    await client.disconnect()
 
 
 with client:
     client.loop.run_until_complete(main())
-    client.run_until_disconnected()
