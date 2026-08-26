@@ -1,4 +1,4 @@
-name: Telegram Mirror Bot
+name: Telegram Mirror
 
 on:
   workflow_dispatch:
@@ -27,25 +27,28 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run mirror
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          SOURCE_GROUP: ${{ secrets.SOURCE_GROUP }}
+          TARGET_GROUP: ${{ secrets.TARGET_GROUP }}
           RATE_LIMIT: "2"
-          MAX_DOWNLOAD_WORKERS: "3"   # keep low — runner has ~14GB disk
-          IDLE_EXIT_MIN: "20"
+          MAX_DOWNLOAD_WORKERS: "3"
           PYTHONUNBUFFERED: "1"
+          # START_ID: "1"
+          # END_ID: "50000"
         run: python -u bot.py
 
       - name: Commit resume state
-        if: always()          # saves task.json even if the job was killed by timeout
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add task.json
+          git add task.json 2>/dev/null || true
           if git diff --cached --quiet; then
-            echo "No state changes"
+            echo "No task.json changes"
           else
             git commit -m "resume state: $(date -u +'%Y-%m-%d %H:%M') UTC"
             git push
