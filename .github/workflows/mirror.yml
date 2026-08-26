@@ -1,4 +1,4 @@
-name: Telegram Video Mirror
+name: Telegram Mirror Bot
 
 on:
   workflow_dispatch:
@@ -27,28 +27,26 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run mirror
+      - name: Run bot
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
-          SOURCE_GROUP: ${{ secrets.SOURCE_GROUP }}
-          TARGET_GROUP: ${{ secrets.TARGET_GROUP }}
+          RATE_LIMIT: "2"
+          MAX_DOWNLOAD_WORKERS: "3"   # keep low — runner has ~14GB disk
+          IDLE_EXIT_MIN: "20"
           PYTHONUNBUFFERED: "1"
-          # TIME_BUDGET_MIN: "240"
-          # MAX_VIDEOS_PER_RUN: "1000"
-          # DELAY_SECONDS: "2"
-        run: python -u mirror.py
+        run: python -u bot.py
 
-      - name: Commit progress
-        if: always()
+      - name: Commit resume state
+        if: always()          # saves task.json even if the job was killed by timeout
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add progress.json
+          git add task.json
           if git diff --cached --quiet; then
-            echo "No progress changes"
+            echo "No state changes"
           else
-            git commit -m "progress: $(date -u +'%Y-%m-%d %H:%M') UTC"
+            git commit -m "resume state: $(date -u +'%Y-%m-%d %H:%M') UTC"
             git push
           fi
